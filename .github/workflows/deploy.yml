@@ -1,0 +1,96 @@
+name: Deploy AgentCore to AWS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-cdk:
+    name: Build CDK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Build
+        working-directory: cdk
+        run: npm install && npm run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cdk-build
+          path: |
+            cdk/lib/
+            cdk/bin/
+            cdk/package-lock.json
+            cdk/package.json
+            agent/
+          retention-days: 1
+
+  deploy-cdk:
+    name: Deploy CDK
+    runs-on: ubuntu-latest
+    needs: build-cdk
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: cdk-build
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: eu-central-1
+
+      - name: Install and build
+        run: |
+          npm install -g aws-cdk
+          cd cdk && npm install && npm run build
+
+      - name: Install Python agent deps (ARM64)
+        run: |
+          pip install uv
+          uv pip install -r agent/requirements.txt \
+            --target agent/ \
+            --python-platform aarch64-manylinux2014 \
+            --python-version 3.12 \
+            --only-binary :all:
+          find agent/ -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+          find agent/ -name "*.pyc" -delete 2>/dev/null || true
+
+      - name: Deploy with CDK
+        working-directory: cdk
+        env:
+          STAGE: prod
+          AWS_DEFAULT_REGION: eu-central-1
+        run: |
+          cdk bootstrap || true
+
+          # Detect stack name
+          STACK_NAME=$(ls cdk.out/*.template.json 2>/dev/null | head -1 | xargs basename 2>/dev/null | sed 's/.template.json//') || true
+
+          # Clean up failed stacks before deploy
+          if [ -n "$STACK_NAME" ]; then
+            STATUS=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo "NONE")
+            if echo "$STATUS" | grep -qE "ROLLBACK_COMPLETE|ROLLBACK_FAILED|DELETE_FAILED|CREATE_FAILED"; then
+              echo "Deleting failed stack ($STATUS)..."
+              aws cloudformation delete-stack --stack-name "$STACK_NAME"
+              aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME" 2>/dev/null || true
+            fi
+          fi
+
+          cdk deploy --require-approval never --all --outputs-file outputs.json
+          cat outputs.json 2>/dev/null || echo "Done"
+
+      - name: Upload outputs
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-outputs
+          path: cdk/outputs.json
+          retention-days: 7

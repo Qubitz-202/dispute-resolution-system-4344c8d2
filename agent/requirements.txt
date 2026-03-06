@@ -1,0 +1,10 @@
+strands-agents[otel]==1.21.0
+aws-opentelemetry-distro
+strands-agents-tools==0.2.19
+bedrock-agentcore==1.2.0
+boto3
+requests==2.32.5
+beautifulsoup4==4.12.3
+lxml
+mcp-proxy-for-aws
+fpdf2
